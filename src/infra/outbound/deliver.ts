@@ -15,8 +15,11 @@ import type { OpenClawConfig } from "../../config/config.js";
 import { resolveMarkdownTableMode } from "../../config/markdown-tables.js";
 import {
   appendAssistantMessageToSessionTranscript,
+  loadSessionStore,
   resolveMirroredTranscriptText,
+  resolveStorePath,
 } from "../../config/sessions.js";
+import { resolveSessionAgentId } from "../../agents/agent-scope.js";
 import type { sendMessageDiscord } from "../../discord/send.js";
 import { createInternalHookEvent, triggerInternalHook } from "../../hooks/internal-hooks.js";
 import type { sendMessageIMessage } from "../../imessage/send.js";
@@ -301,6 +304,38 @@ async function deliverOutboundPayloadsCore(
     cfg,
     params.session?.agentId ?? params.mirror?.agentId,
   );
+
+  // Slack auto-thread: when session originates from a thread but no threadId is provided,
+  // automatically use the session's lastThreadId to keep replies in the same thread.
+  // This prevents accidental top-level replies when the agent outputs text without
+  // explicitly specifying threadId.
+  let effectiveThreadId = params.threadId;
+  let effectiveReplyToId = params.replyToId;
+  if (
+    channel === "slack" &&
+    effectiveThreadId == null &&
+    effectiveReplyToId == null &&
+    params.session?.key
+  ) {
+    try {
+      const agentId =
+        params.session.agentId ??
+        resolveSessionAgentId({ sessionKey: params.session.key, config: cfg });
+      const storePath = resolveStorePath(cfg.session?.store, { agentId });
+      const store = loadSessionStore(storePath);
+      const entry = store[params.session.key.toLowerCase()] ?? store[params.session.key];
+      if (entry?.lastChannel === "slack" && entry?.lastThreadId != null) {
+        effectiveThreadId = entry.lastThreadId;
+        log.info(
+          { sessionKey: params.session.key, threadId: effectiveThreadId },
+          "slack auto-thread: using session lastThreadId",
+        );
+      }
+    } catch {
+      // Best-effort: don't fail delivery if session lookup fails
+    }
+  }
+
   const results: OutboundDeliveryResult[] = [];
   const handler = await createChannelHandler({
     cfg,
@@ -308,8 +343,8 @@ async function deliverOutboundPayloadsCore(
     to,
     deps,
     accountId,
-    replyToId: params.replyToId,
-    threadId: params.threadId,
+    replyToId: effectiveReplyToId,
+    threadId: effectiveThreadId,
     identity: params.identity,
     gifPlayback: params.gifPlayback,
     silent: params.silent,
