@@ -78,6 +78,61 @@ Set `streaming.mode: "off"` to send the completed reply without streaming update
 
 Replies with controls use native cards for command buttons and HTTP(S) links, including when streaming is off. The card carries the reply text; attachments remain separate messages. Unsupported controls and cards that exceed Feishu's size limits keep their full labels in a readable fallback. That fallback remains a separate message when a later reply streams. A final controls reply replaces an active streaming preview without sending the preview text again; error controls after a completed answer remain separate. If Feishu cannot delete or clear a replaced preview, delivery reports a failure and retains the original message receipt.
 
+#### Commentary progress
+
+To show the assistant's progress updates in Feishu while it works, enable both
+`streaming.mode: "progress"` and `streaming.progress.commentary: true`:
+
+```json5
+{
+  channels: {
+    feishu: {
+      streaming: {
+        mode: "progress",
+        progress: {
+          commentary: true,
+          maxLines: 8,
+          maxLineChars: 120,
+          label: false,
+        },
+      },
+    },
+  },
+}
+```
+
+The plugin automatically renders authored commentary/preamble events in one
+updating card in the reply's chat or thread. The assistant does not need to call
+the `message` tool for these updates. This is public progress narration, not
+hidden reasoning. Commentary is off unless explicitly enabled; existing `off`
+and `partial` configurations keep their behavior. `renderMode: "raw"` disables
+progress cards too.
+
+Progress previews are also disabled when a `reply_payload_sending` or
+`message_sending` hook can change or cancel the outgoing reply, or when a reply
+must notify another bot through native mentions. These paths keep normal final
+delivery without an eager progress card.
+
+Progress mode does not stream partial answer text. Its commentary is temporary:
+the completed answer replaces the progress card through normal final delivery,
+with the existing fallback for controls and attachments. Do not rely on the
+progress card as a permanent log or include information there that the final
+answer needs to preserve.
+
+`maxLines` and `maxLineChars` bound the visible commentary (defaults: `8` and
+`120`). Use `label: false` to hide the label, a string for a fixed label, or
+`label: "auto"` with an optional `labels` list. Feishu supports these layout
+options and `commentary`; tool-log and utility-narration options from other
+channels are not supported.
+
+The same configuration is available under
+`channels.feishu.accounts.<id>.streaming`. An account without `streaming`
+inherits the channel setting. An account that supplies `streaming` replaces
+that object, so repeat `mode` and the desired `progress` options in an override.
+
+See [Progress drafts](/concepts/progress-drafts) for the shared presentation
+concepts.
+
 ### Quota optimization
 
 Reduce the number of Feishu/Lark API calls with two optional flags:

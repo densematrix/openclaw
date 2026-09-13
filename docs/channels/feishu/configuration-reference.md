@@ -55,7 +55,13 @@ Full configuration: [Gateway configuration](/gateway/configuration)
 | `channels.feishu.streaming.chunkMode`                    | Chunk splitting (`length` or `newline`)                                              | `length`                             |
 | `channels.feishu.mediaMaxMb`                             | Media size limit                                                                     | `30`                                 |
 | `channels.feishu.renderMode`                             | Reply rendering (`auto`, `raw`, `card`)                                              | `auto`                               |
-| `channels.feishu.streaming.mode`                         | Streaming card output (`partial` or `off`)                                           | `partial`                            |
+| `channels.feishu.streaming.mode`                         | Streaming card output (`off`, `partial`, or `progress`)                              | `partial`                            |
+| `channels.feishu.streaming.progress.commentary`          | Show authored commentary in a temporary progress card (requires `progress` mode)     | `false`                              |
+| `channels.feishu.streaming.progress.maxLines`            | Maximum visible progress lines                                                       | `8`                                  |
+| `channels.feishu.streaming.progress.maxLineChars`        | Maximum characters per progress line                                                 | `120`                                |
+| `channels.feishu.streaming.progress.label`               | Progress label (`auto`, a fixed string, or `false` to hide)                          | `auto`                               |
+| `channels.feishu.streaming.progress.labels`              | Optional label pool for `auto`                                                       | built-in labels                      |
+| `channels.feishu.accounts.<id>.streaming`                | Per-account replacement for the channel streaming object                             | inherited                            |
 | `channels.feishu.streaming.block.enabled`                | Completed-block reply streaming                                                      | `false`                              |
 | `channels.feishu.typingIndicator`                        | Send typing reactions                                                                | `true`                               |
 | `channels.feishu.resolveSenderNames`                     | Resolve sender display names                                                         | `true`                               |
