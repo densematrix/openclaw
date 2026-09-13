@@ -286,6 +286,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   // therefore uses normal cards/posts so every emitted unit reaches the peer bot.
   const streamingMode = resolveChannelPreviewStreamMode(account.config, "partial");
   const progressMode = streamingMode === "progress";
+  // Raw replies use core's completed commentary payloads, not CardKit previews.
+  // Core owns ordering, hooks, and deduplication for these ordinary messages.
+  const plainCommentaryEnabled =
+    renderMode === "raw" && progressMode && account.config.streaming?.progress?.commentary === true;
   const streamingEnabled =
     !requiredMentionTargets?.length && streamingMode !== "off" && renderMode !== "raw";
   const hookRunner = getGlobalHookRunner();
@@ -1560,7 +1564,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         // Later finals replace stream text. Each presentation fallback owns a
         // separate message; ordinary blocks retain their streaming policy.
         if (hasPresentationFallback || (info?.kind === "block" && !useStreamingCard)) {
-          if (hasPresentationFallback || coreBlockStreamingEnabled) {
+          if (
+            hasPresentationFallback ||
+            coreBlockStreamingEnabled ||
+            (plainCommentaryEnabled && payload.isCommentary === true)
+          ) {
             const firstChunkMentions =
               info?.kind === "final" || (info?.kind === "block" && !sentIndependentBlockText)
                 ? mentionTargets
@@ -1710,17 +1718,17 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     delivery,
     replyOptions: {
       onModelSelected,
-      // Register the draft as the commentary owner with core. Merely supplying
-      // onItemEvent leaves quiet turns behind the verbose tool-progress gate.
-      ...(commentaryProgress.commentaryProgressEnabled
+      // Register one commentary owner with core: completed payloads for raw
+      // messages, or a progress draft for cards, including quiet turns.
+      ...(plainCommentaryEnabled || commentaryProgress.commentaryProgressEnabled
         ? {
             suppressDefaultToolProgressMessages: true,
             commentaryProgressEnabled: true,
             commentaryPayloadsEnabled: true,
-            shouldDeliverCommentaryPayloads: () => false,
+            shouldDeliverCommentaryPayloads: () => plainCommentaryEnabled,
             onQueuedFollowupAdmitted: async () => {
               // Queue drains reuse these callbacks after the original dispatch
-              // has gone idle. Settle its card before reopening the compositor.
+              // has gone idle. Reset delivery state for either presentation.
               await queueIdleSideEffects();
               commentaryProgress.beginNewTurn({ force: true });
               deliveredFinalTexts.clear();

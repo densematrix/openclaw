@@ -519,12 +519,18 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       expect(streamingInstances).toHaveLength(1);
     });
 
-    it.each(["off", "on"] as const)(
-      "forwards commentary through real group dispatch with verbose %s and no durable duplicate",
-      async (verboseDefault) => {
+    it.each([
+      { verboseDefault: "off", renderMode: "auto" },
+      { verboseDefault: "on", renderMode: "auto" },
+      { verboseDefault: "off", renderMode: "raw" },
+      { verboseDefault: "on", renderMode: "raw" },
+    ] as const)(
+      "forwards commentary through real group dispatch: $renderMode, verbose $verboseDefault",
+      async ({ verboseDefault, renderMode }) => {
         const tempDir = await mkdtemp(path.join(os.tmpdir(), "feishu-commentary-dispatch-"));
         try {
-          const { callbacks, options } = progressHarness();
+          const { callbacks, options } = progressHarness({ renderMode });
+          const plain = renderMode === "raw";
           let reachedResolver = false;
           await dispatchInboundMessageWithBufferedDispatcher({
             cfg: {
@@ -536,32 +542,58 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
               Body: "Check the workspace",
               From: "feishu:chat:oc_chat",
               To: "feishu:chat:oc_chat",
-              SessionKey: `agent:main:feishu:group:commentary-${verboseDefault}`,
+              SessionKey: `agent:main:feishu:group:commentary-${renderMode}-${verboseDefault}`,
               Provider: "feishu",
               Surface: "feishu",
               ChatType: "group",
               SenderId: "ou_test",
-              MessageSid: `om_commentary_${verboseDefault}`,
+              MessageSid: `om_commentary_${renderMode}_${verboseDefault}`,
             },
             dispatcherOptions: options,
             replyOptions: callbacks,
             replyResolver: async (_ctx, replyOptions) => {
               reachedResolver = true;
               expect(replyOptions?.commentaryProgressEnabled).toBe(true);
-              expect(replyOptions?.commentaryPayloadsEnabled).toBe(false);
+              expect(replyOptions?.commentaryPayloadsEnabled).toBe(plain);
+              if (plain) {
+                await replyOptions?.onBlockReply?.({
+                  text: "Checking through core dispatch",
+                  isCommentary: true,
+                });
+              }
               await replyOptions?.onItemEvent?.({
                 kind: "preamble",
                 itemId: "real-dispatch",
+                ...(plain ? { suppressDurableProgress: true } : {}),
                 progressText: "Checking through core dispatch",
               });
-              expect(streamingUpdateTexts().at(-1)).toContain("Checking through core dispatch");
+              if (!plain) {
+                expect(streamingUpdateTexts().at(-1)).toContain("Checking through core dispatch");
+              }
               return { text: "Canonical answer" };
             },
           });
           expect(reachedResolver).toBe(true);
-          expect(firstStreamingCloseText()).toBe("Canonical answer");
-          expect(streamingInstances).toHaveLength(1);
-          expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+          if (plain) {
+            expect(sendMessageFeishuMock.mock.calls.map(([p]) => p.text)).toEqual([
+              "Checking through core dispatch",
+              "Canonical answer",
+            ]);
+            for (const [params] of sendMessageFeishuMock.mock.calls) {
+              expect(params).toMatchObject({
+                to: "oc_chat",
+                replyToMessageId: "om_reply",
+                replyInThread: true,
+              });
+            }
+            expect(streamingInstances).toHaveLength(0);
+            expect(sendStructuredCardFeishuMock).not.toHaveBeenCalled();
+            expect(sendCardFeishuMock).not.toHaveBeenCalled();
+          } else {
+            expect(firstStreamingCloseText()).toBe("Canonical answer");
+            expect(streamingInstances).toHaveLength(1);
+            expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+          }
         } finally {
           await rm(tempDir, { recursive: true, force: true });
         }
@@ -594,7 +626,6 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       { streaming: { mode: "partial", progress: { commentary: true } } },
       { streaming: { mode: "progress", progress: { commentary: false } } },
       { streaming: { mode: "progress" } },
-      { renderMode: "raw" },
     ])("keeps unsupported or disabled commentary quiet: %j", async (config) => {
       const { callbacks } = progressHarness(config);
       await callbacks.onItemEvent?.({
@@ -604,6 +635,67 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       });
       expect(streamingInstances).toHaveLength(0);
     });
+
+    it("sends only completed commentary blocks in raw mode and keeps final independent", async () => {
+      const { callbacks, options } = progressHarness({ renderMode: "raw" });
+      expect(callbacks.commentaryPayloadsEnabled).toBe(true);
+      expect(callbacks.onItemEvent).toBeUndefined();
+      expect(callbacks.onPartialReply).toBeUndefined();
+      await options.deliver({ text: "Unrequested answer block" }, { kind: "block" });
+      expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+      await options.deliver({ text: "Checking files", isCommentary: true }, { kind: "block" });
+      await options.deliver({ text: "```ts\nconst answer = 42;\n```" }, { kind: "final" });
+      await options.onIdle?.();
+      expect(sendMessageFeishuMock.mock.calls.map(([p]) => p.text)).toEqual([
+        "Checking files",
+        "```ts\nconst answer = 42;\n```",
+      ]);
+      expect(streamingInstances).toHaveLength(0);
+      expect(sendStructuredCardFeishuMock).not.toHaveBeenCalled();
+    });
+
+    it("delivers repeated final text on queued raw followups without cards", async () => {
+      const { callbacks, options } = progressHarness({ renderMode: "raw" });
+      await options.deliver({ text: "Same answer" }, { kind: "final" });
+      await options.onIdle?.();
+      options.onCleanup?.();
+      await callbacks.onQueuedFollowupAdmitted?.();
+      await options.deliver({ text: "Checking again", isCommentary: true }, { kind: "block" });
+      await options.deliver({ text: "Same answer" }, { kind: "final" });
+      await callbacks.onQueuedFollowupSettled?.();
+      expect(sendMessageFeishuMock.mock.calls.map(([p]) => p.text)).toEqual([
+        "Same answer",
+        "Checking again",
+        "Same answer",
+      ]);
+      expect(streamingInstances).toHaveLength(0);
+    });
+
+    it("keeps final delivery working after a raw commentary send fails", async () => {
+      const { options } = progressHarness({ renderMode: "raw" });
+      sendMessageFeishuMock.mockRejectedValueOnce(new Error("temporary send failure"));
+      await expect(
+        options.deliver({ text: "Checking", isCommentary: true }, { kind: "block" }),
+      ).rejects.toThrow();
+      await options.deliver({ text: "Final answer" }, { kind: "final" });
+      await options.onIdle?.();
+      expect(sendMessageFeishuMock.mock.calls.at(-1)?.[0].text).toBe("Final answer");
+      expect(streamingInstances).toHaveLength(0);
+    });
+
+    it.each(["off", "partial", "progress"] as const)(
+      "keeps raw commentary disabled without an explicit opt-in in %s mode",
+      async (mode) => {
+        const { callbacks, options } = progressHarness({
+          renderMode: "raw",
+          streaming: { mode, progress: { commentary: false } },
+        });
+        expect(callbacks.commentaryPayloadsEnabled).not.toBe(true);
+        await options.deliver({ text: "Hidden commentary", isCommentary: true }, { kind: "block" });
+        expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+        expect(streamingInstances).toHaveLength(0);
+      },
+    );
 
     it("deduplicates snapshots and keeps retractions and final text separate", async () => {
       const { callbacks, options } = progressHarness();

@@ -105,15 +105,23 @@ The plugin automatically renders authored commentary/preamble events in one
 updating card in the reply's chat or thread. The assistant does not need to call
 the `message` tool for these updates. This is public progress narration, not
 hidden reasoning. Commentary is off unless explicitly enabled; existing `off`
-and `partial` configurations keep their behavior. `renderMode: "raw"` disables
-progress cards too.
+and `partial` configurations keep their behavior.
+
+To keep commentary without cards, add `renderMode: "raw"` alongside the progress
+configuration above and leave `streaming.block.enabled: false`. Each completed
+commentary paragraph is delivered as an ordinary message in the same chat or
+thread, followed by the completed answer. No streaming card is created or
+updated. These commentary messages remain in history; the card layout limits
+(`maxLines`, `maxLineChars`, and `label`) do not apply to them. Normal message
+limits, send hooks, and required mentions still apply. Explicit controls keep
+their native cards as described above.
 
 Progress previews are also disabled when a `reply_payload_sending` or
 `message_sending` hook can change or cancel the outgoing reply, or when a reply
 must notify another bot through native mentions. These paths keep normal final
 delivery without an eager progress card.
 
-Progress mode does not stream partial answer text. Its commentary is temporary:
+Progress mode does not stream partial answer text. In card mode, commentary is temporary:
 the completed answer replaces the progress card through normal final delivery,
 with the existing fallback for controls and attachments. Do not rely on the
 progress card as a permanent log or include information there that the final
