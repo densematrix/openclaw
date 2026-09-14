@@ -324,6 +324,7 @@ export async function runEmbeddedFallbackCandidate(
               (sourceReplyDeliveryRuntime?.currentMode ??
                 turn.followupRun.run.sourceReplyDeliveryMode) === "message_tool_only",
             messageToolDeliveryState: params.messageToolDeliveryState,
+            blockReplyHandler: params.presentation.blockReplyHandler,
             provider: params.provider,
             model: params.model,
             runId: params.runId,

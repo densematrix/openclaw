@@ -1,6 +1,7 @@
 // Feishu helper module supports config schema behavior.
 import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 import {
+  ChannelStreamingProgressSchema,
   ContextVisibilityModeSchema,
   DmPolicySchema,
   GroupPolicySchema,
@@ -130,13 +131,21 @@ const BlockStreamingCoalesceSchema = z
   .optional();
 
 // Streaming config: `mode` gates Feishu Card Kit streaming-card replies
-// ("partial" = streaming cards, default; "off" = single final message);
+// ("partial" = answer previews, default; "progress" = temporary progress cards;
+// "off" = single final message);
 // `chunkMode`/`block` are the shared delivery controls. Legacy boolean
 // `streaming` and flat chunkMode/blockStreaming/blockStreamingCoalesce keys
 // migrate via `openclaw doctor --fix`.
 const FeishuStreamingSchema = z
   .object({
-    mode: z.enum(["off", "partial"]).optional(),
+    mode: z.enum(["off", "partial", "progress"]).optional(),
+    progress: ChannelStreamingProgressSchema.pick({
+      commentary: true,
+      label: true,
+      labels: true,
+      maxLines: true,
+      maxLineChars: true,
+    }).optional(),
     chunkMode: z.enum(["length", "newline"]).optional(),
     block: z
       .object({

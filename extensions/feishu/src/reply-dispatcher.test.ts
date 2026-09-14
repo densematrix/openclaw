@@ -1,11 +1,16 @@
+import { mkdtemp, rm } from "node:fs/promises";
 // Feishu tests cover reply dispatcher plugin behavior.
 import os from "node:os";
 import path from "node:path";
 import {
   createChannelPartialDeliveryError,
   isChannelPartialDeliveryError,
+  type ChannelInboundTurnPlan,
 } from "openclaw/plugin-sdk/channel-inbound";
-import { createReplyDispatcher } from "openclaw/plugin-sdk/reply-runtime";
+import {
+  createReplyDispatcher,
+  dispatchInboundMessageWithBufferedDispatcher,
+} from "openclaw/plugin-sdk/reply-runtime";
 import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { afterAll, beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 
@@ -466,6 +471,370 @@ describe("createFeishuReplyDispatcher streaming behavior", () => {
       typeof call[0] === "string" ? call[0] : "",
     );
   }
+
+  describe("commentary progress", () => {
+    function progressHarness(config: Record<string, unknown> = {}) {
+      resolveFeishuAccountMock.mockReturnValue({
+        accountId: "main",
+        appId: "app_id",
+        appSecret: "app_secret",
+        domain: "feishu",
+        config: {
+          renderMode: "auto",
+          streaming: { mode: "progress", progress: { commentary: true, label: false } },
+          ...config,
+        },
+      });
+      const harness = createDispatcherHarness({
+        replyToMessageId: "om_reply",
+        rootId: "om_root",
+        replyInThread: true,
+      });
+      const callbacks: NonNullable<ChannelInboundTurnPlan["replyOptions"]> =
+        harness.result.replyOptions;
+      return { ...harness, callbacks };
+    }
+
+    it("renders commentary before final delivery without a message tool call", async () => {
+      const { callbacks, options } = progressHarness();
+      expect(callbacks.onItemEvent).toBeTypeOf("function");
+      await callbacks.onItemEvent?.({
+        kind: "preamble",
+        itemId: "c1",
+        phase: "completed",
+        progressText: "Checking the workspace",
+      });
+      expect(streamingUpdateTexts().at(-1)).toContain("Checking the workspace");
+      expectStreamingStartOptions(0, {
+        replyToMessageId: "om_reply",
+        replyInThread: true,
+        rootId: "om_root",
+      });
+      expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+      expect(callbacks.onPartialReply).toBeUndefined();
+      const delivery = await options.deliver({ text: "Canonical answer" }, { kind: "final" });
+      await options.onIdle?.();
+      await delivery?.finalization;
+      expect(firstStreamingCloseText()).toBe("Canonical answer");
+      expect(streamingInstances).toHaveLength(1);
+    });
+
+    it.each([
+      { verboseDefault: "off", renderMode: "auto" },
+      { verboseDefault: "on", renderMode: "auto" },
+      { verboseDefault: "off", renderMode: "raw" },
+      { verboseDefault: "on", renderMode: "raw" },
+    ] as const)(
+      "forwards commentary through real group dispatch: $renderMode, verbose $verboseDefault",
+      async ({ verboseDefault, renderMode }) => {
+        const tempDir = await mkdtemp(path.join(os.tmpdir(), "feishu-commentary-dispatch-"));
+        try {
+          const { callbacks, options } = progressHarness({ renderMode });
+          const plain = renderMode === "raw";
+          let reachedResolver = false;
+          await dispatchInboundMessageWithBufferedDispatcher({
+            cfg: {
+              session: { store: path.join(tempDir, "sessions.json") },
+              agents: { defaults: { workspace: tempDir, verboseDefault } },
+              messages: { groupChat: { visibleReplies: "automatic" } },
+            },
+            ctx: {
+              Body: "Check the workspace",
+              From: "feishu:chat:oc_chat",
+              To: "feishu:chat:oc_chat",
+              SessionKey: `agent:main:feishu:group:commentary-${renderMode}-${verboseDefault}`,
+              Provider: "feishu",
+              Surface: "feishu",
+              ChatType: "group",
+              SenderId: "ou_test",
+              MessageSid: `om_commentary_${renderMode}_${verboseDefault}`,
+            },
+            dispatcherOptions: options,
+            replyOptions: callbacks,
+            replyResolver: async (_ctx, replyOptions) => {
+              reachedResolver = true;
+              expect(replyOptions?.commentaryProgressEnabled).toBe(true);
+              expect(replyOptions?.commentaryPayloadsEnabled).toBe(plain);
+              if (plain) {
+                await replyOptions?.onBlockReply?.({
+                  text: "Checking through core dispatch",
+                  isCommentary: true,
+                });
+              }
+              await replyOptions?.onItemEvent?.({
+                kind: "preamble",
+                itemId: "real-dispatch",
+                ...(plain ? { suppressDurableProgress: true } : {}),
+                progressText: "Checking through core dispatch",
+              });
+              if (!plain) {
+                expect(streamingUpdateTexts().at(-1)).toContain("Checking through core dispatch");
+              }
+              return { text: "Canonical answer" };
+            },
+          });
+          expect(reachedResolver).toBe(true);
+          if (plain) {
+            expect(sendMessageFeishuMock.mock.calls.map(([p]) => p.text)).toEqual([
+              "Checking through core dispatch",
+              "Canonical answer",
+            ]);
+            for (const [params] of sendMessageFeishuMock.mock.calls) {
+              expect(params).toMatchObject({
+                to: "oc_chat",
+                replyToMessageId: "om_reply",
+                replyInThread: true,
+              });
+            }
+            expect(streamingInstances).toHaveLength(0);
+            expect(sendStructuredCardFeishuMock).not.toHaveBeenCalled();
+            expect(sendCardFeishuMock).not.toHaveBeenCalled();
+          } else {
+            expect(firstStreamingCloseText()).toBe("Canonical answer");
+            expect(streamingInstances).toHaveLength(1);
+            expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+          }
+        } finally {
+          await rm(tempDir, { recursive: true, force: true });
+        }
+      },
+    );
+
+    it("reopens a settled dispatcher for queued commentary and settles a silent followup", async () => {
+      const { callbacks, options } = progressHarness();
+      await callbacks.onItemEvent?.({ kind: "preamble", itemId: "c1", progressText: "First turn" });
+      const first = await options.deliver({ text: "First answer" }, { kind: "final" });
+      await options.onIdle?.();
+      await first?.finalization;
+      options.onCleanup?.();
+      await callbacks.onQueuedFollowupAdmitted?.();
+      await callbacks.onItemEvent?.({
+        kind: "preamble",
+        itemId: "c2",
+        progressText: "Queued turn",
+      });
+      expect(streamingUpdateTexts(1).at(-1)).toContain("Queued turn");
+      expect(streamingUpdateTexts(1).join("")).not.toContain("First turn");
+      await callbacks.onQueuedFollowupSettled?.();
+      expect(requireStreamingInstance(1).discard).toHaveBeenCalledTimes(1);
+      await callbacks.onItemEvent?.({ kind: "preamble", itemId: "late", progressText: "Too late" });
+      expect(streamingInstances).toHaveLength(2);
+    });
+
+    it.each([
+      { streaming: { mode: "off", progress: { commentary: true } } },
+      { streaming: { mode: "partial", progress: { commentary: true } } },
+      { streaming: { mode: "progress", progress: { commentary: false } } },
+      { streaming: { mode: "progress" } },
+    ])("keeps unsupported or disabled commentary quiet: %j", async (config) => {
+      const { callbacks } = progressHarness(config);
+      await callbacks.onItemEvent?.({
+        kind: "preamble",
+        itemId: "c1",
+        progressText: "Private progress",
+      });
+      expect(streamingInstances).toHaveLength(0);
+    });
+
+    it("sends only completed commentary blocks in raw mode and keeps final independent", async () => {
+      const { callbacks, options } = progressHarness({ renderMode: "raw" });
+      expect(callbacks.commentaryPayloadsEnabled).toBe(true);
+      expect(callbacks.onItemEvent).toBeUndefined();
+      expect(callbacks.onPartialReply).toBeUndefined();
+      await options.deliver({ text: "Unrequested answer block" }, { kind: "block" });
+      expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+      await options.deliver({ text: "Checking files", isCommentary: true }, { kind: "block" });
+      await options.deliver({ text: "```ts\nconst answer = 42;\n```" }, { kind: "final" });
+      await options.onIdle?.();
+      expect(sendMessageFeishuMock.mock.calls.map(([p]) => p.text)).toEqual([
+        "Checking files",
+        "```ts\nconst answer = 42;\n```",
+      ]);
+      expect(streamingInstances).toHaveLength(0);
+      expect(sendStructuredCardFeishuMock).not.toHaveBeenCalled();
+    });
+
+    it("delivers repeated final text on queued raw followups without cards", async () => {
+      const { callbacks, options } = progressHarness({ renderMode: "raw" });
+      await options.deliver({ text: "Same answer" }, { kind: "final" });
+      await options.onIdle?.();
+      options.onCleanup?.();
+      await callbacks.onQueuedFollowupAdmitted?.();
+      await options.deliver({ text: "Checking again", isCommentary: true }, { kind: "block" });
+      await options.deliver({ text: "Same answer" }, { kind: "final" });
+      await callbacks.onQueuedFollowupSettled?.();
+      expect(sendMessageFeishuMock.mock.calls.map(([p]) => p.text)).toEqual([
+        "Same answer",
+        "Checking again",
+        "Same answer",
+      ]);
+      expect(streamingInstances).toHaveLength(0);
+    });
+
+    it("keeps final delivery working after a raw commentary send fails", async () => {
+      const { options } = progressHarness({ renderMode: "raw" });
+      sendMessageFeishuMock.mockRejectedValueOnce(new Error("temporary send failure"));
+      await expect(
+        options.deliver({ text: "Checking", isCommentary: true }, { kind: "block" }),
+      ).rejects.toThrow();
+      await options.deliver({ text: "Final answer" }, { kind: "final" });
+      await options.onIdle?.();
+      expect(sendMessageFeishuMock.mock.calls.at(-1)?.[0].text).toBe("Final answer");
+      expect(streamingInstances).toHaveLength(0);
+    });
+
+    it.each(["off", "partial", "progress"] as const)(
+      "keeps raw commentary disabled without an explicit opt-in in %s mode",
+      async (mode) => {
+        const { callbacks, options } = progressHarness({
+          renderMode: "raw",
+          streaming: { mode, progress: { commentary: false } },
+        });
+        expect(callbacks.commentaryPayloadsEnabled).not.toBe(true);
+        await options.deliver({ text: "Hidden commentary", isCommentary: true }, { kind: "block" });
+        expect(sendMessageFeishuMock).not.toHaveBeenCalled();
+        expect(streamingInstances).toHaveLength(0);
+      },
+    );
+
+    it("deduplicates snapshots and keeps retractions and final text separate", async () => {
+      const { callbacks, options } = progressHarness();
+      const emit = (progressText: string, itemId = "c1") =>
+        callbacks.onItemEvent?.({ kind: "preamble", itemId, progressText });
+      await emit("Checking");
+      await emit("Checking the workspace");
+      const count = streamingUpdateTexts().length;
+      await emit("Checking the workspace");
+      expect(streamingUpdateTexts()).toHaveLength(count);
+      await emit("Reading files", "c2");
+      expect(
+        streamingUpdateTexts()
+          .at(-1)
+          ?.match(/Checking/g),
+      ).toHaveLength(1);
+      await emit("", "c1");
+      expect(streamingUpdateTexts().at(-1)).not.toContain("Checking");
+      await callbacks.onItemEvent?.({ kind: "reasoning", progressText: "Hidden reasoning" });
+      expect(streamingUpdateTexts().join("")).not.toContain("Hidden reasoning");
+      const delivery = await options.deliver({ text: "Final only" }, { kind: "final" });
+      const afterFinal = streamingUpdateTexts().length;
+      await emit("Too late", "c3");
+      await options.onIdle?.();
+      await delivery?.finalization;
+      expect(firstStreamingCloseText()).toBe("Final only");
+      expect(streamingUpdateTexts().slice(afterFinal).join("")).not.toContain("Too late");
+    });
+
+    it.each(["reply_payload_sending", "message_sending"])(
+      "does not bypass %s hooks with commentary",
+      async (hookName) => {
+        getGlobalHookRunnerMock.mockReturnValue({ hasHooks: (name: string) => name === hookName });
+        const { callbacks } = progressHarness();
+        await callbacks.onItemEvent?.({ kind: "preamble", itemId: "c1", progressText: "Checking" });
+        expect(streamingInstances).toHaveLength(0);
+      },
+    );
+
+    it("removes the last retracted commentary card and can start a fresh one", async () => {
+      const { callbacks, options } = progressHarness();
+      await callbacks.onItemEvent?.({ kind: "preamble", itemId: "c1", progressText: "Checking" });
+      await callbacks.onItemEvent?.({ kind: "preamble", itemId: "c1", progressText: "" });
+      expect(requireStreamingInstance(0).discard).toHaveBeenCalledTimes(1);
+      await callbacks.onItemEvent?.({ kind: "preamble", itemId: "c2", progressText: "Reading" });
+      expect(streamingUpdateTexts(1).at(-1)).toContain("Reading");
+      await options.onIdle?.();
+      expect(requireStreamingInstance(1).discard).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not expose reasoning tags or erase commentary on assistant-message start", async () => {
+      const { callbacks, options } = progressHarness();
+      await callbacks.onItemEvent?.({
+        kind: "preamble",
+        itemId: "c1",
+        progressText: "<think>Hidden secret</think>Checking files",
+      });
+      await callbacks.onAssistantMessageStart?.();
+      expect(streamingUpdateTexts().at(-1)).toContain("Checking files");
+      expect(streamingUpdateTexts().join("")).not.toContain("Hidden secret");
+      expect(callbacks.onReasoningStream).toBeUndefined();
+      await options.onIdle?.();
+    });
+
+    it("preserves delivered answer blocks when progress ends without a final", async () => {
+      const { callbacks, options } = progressHarness({
+        streaming: {
+          mode: "progress",
+          block: { enabled: true },
+          progress: { commentary: true, label: false },
+        },
+      });
+      await callbacks.onItemEvent?.({ kind: "preamble", itemId: "c1", progressText: "Checking" });
+      const delivery = await options.deliver({ text: "Completed answer block" }, { kind: "block" });
+      await options.onIdle?.();
+      const settled = await delivery?.finalization;
+      expect(settled?.visibleReplySent).toBe(true);
+      expect(firstStreamingCloseText()).toBe("Completed answer block");
+      expect(requireStreamingInstance(0).discard).not.toHaveBeenCalled();
+    });
+
+    it("preserves a completed block when the last commentary item is retracted", async () => {
+      const { callbacks, options } = progressHarness({
+        streaming: {
+          mode: "progress",
+          block: { enabled: true },
+          progress: { commentary: true, label: false },
+        },
+      });
+      await callbacks.onItemEvent?.({ kind: "preamble", itemId: "c1", progressText: "Checking" });
+      const delivery = await options.deliver({ text: "Completed answer block" }, { kind: "block" });
+      await callbacks.onItemEvent?.({ kind: "preamble", itemId: "c1", progressText: "" });
+      expect(requireStreamingInstance(0).discard).not.toHaveBeenCalled();
+      expect(streamingUpdateTexts().at(-1)).toBe("Completed answer block");
+      await options.onIdle?.();
+      expect((await delivery?.finalization)?.visibleReplySent).toBe(true);
+    });
+
+    it("ignores late commentary after cleanup without an idle callback", async () => {
+      const { callbacks, options } = progressHarness();
+      options.onCleanup?.();
+      await callbacks.onItemEvent?.({ kind: "preamble", itemId: "c1", progressText: "Too late" });
+      expect(streamingInstances).toHaveLength(0);
+    });
+
+    it("recovers final delivery after a commentary update rejects", async () => {
+      const { callbacks, options } = progressHarness();
+      await callbacks.onItemEvent?.({ kind: "preamble", itemId: "c1", progressText: "Checking" });
+      requireStreamingInstance(0).update.mockRejectedValueOnce(
+        new Error("temporary preview failure"),
+      );
+      await callbacks.onItemEvent?.({ kind: "preamble", itemId: "c2", progressText: "Reading" });
+      const delivery = await options.deliver({ text: "Final answer" }, { kind: "final" });
+      await options.onIdle?.();
+      expect((await delivery?.finalization)?.visibleReplySent).toBe(true);
+      expect(firstStreamingCloseText()).toBe("Final answer");
+    });
+
+    it("replaces a progress card with a long static final without leaking progress", async () => {
+      const { callbacks, options } = progressHarness();
+      await callbacks.onItemEvent?.({ kind: "preamble", itemId: "c1", progressText: "Checking" });
+      const text = "Final answer. ".repeat(400);
+      await options.deliver({ text }, { kind: "final" });
+      await options.onIdle?.();
+      expect(requireStreamingInstance(0).discard).toHaveBeenCalledTimes(1);
+      expect(requireStreamingInstance(0).closeWithResult).not.toHaveBeenCalled();
+      expect(sendMessageFeishuMock).toHaveBeenCalledWith(expect.objectContaining({ text }));
+    });
+
+    it("discards commentary on an intentionally silent final", async () => {
+      const { callbacks, options, result } = progressHarness();
+      await callbacks.onItemEvent?.({ kind: "preamble", itemId: "c1", progressText: "Checking" });
+      options.onSkip?.({ text: "NO_REPLY" }, { kind: "final", reason: "silent" });
+      await options.onIdle?.();
+      expect(requireStreamingInstance(0).discard).toHaveBeenCalledTimes(1);
+      expect(requireStreamingInstance(0).closeWithResult).not.toHaveBeenCalled();
+      expect(result.getVisibleReplyState().visibleReplySent).toBe(false);
+    });
+  });
 
   it("skips typing indicator when account typingIndicator is disabled", async () => {
     resolveFeishuAccountMock.mockReturnValue({

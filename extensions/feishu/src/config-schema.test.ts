@@ -1,6 +1,7 @@
 import { validateJsonSchemaValue } from "openclaw/plugin-sdk/json-schema-runtime";
 // Feishu tests cover config schema plugin behavior.
 import { describe, expect, it } from "vitest";
+import { resolveFeishuAccount } from "./accounts.js";
 import { FeishuChannelConfigSchema, FeishuConfigSchema } from "./config-schema.js";
 
 // The NEGATIVE webhook fixtures below spread these bases and add
@@ -439,6 +440,95 @@ describe("FeishuConfigSchema optimization flags", () => {
     });
     expect(result.accounts?.main?.typingIndicator).toBe(false);
     expect(result.accounts?.main?.resolveSenderNames).toBe(false);
+  });
+});
+
+describe("FeishuConfigSchema commentary progress", () => {
+  it.each([
+    { mode: "off" },
+    { mode: "partial" },
+    { mode: "progress" },
+    {
+      mode: "progress",
+      progress: {
+        commentary: true,
+        label: "Investigating",
+        labels: ["Reading", "Checking"],
+        maxLines: 4,
+        maxLineChars: 160,
+      },
+    },
+    { mode: "progress", progress: { commentary: false, label: false } },
+  ])("accepts root and account streaming config %j in both schemas", (streaming) => {
+    for (const value of [{ streaming }, { accounts: { work: { streaming } } }]) {
+      expect(FeishuConfigSchema.parse(value)).toMatchObject(value);
+      const exported = validateJsonSchemaValue({
+        schema: FeishuChannelConfigSchema.schema,
+        cacheKey: "feishu-commentary-progress-test",
+        value,
+        applyDefaults: true,
+      });
+      expect(exported.ok).toBe(true);
+      if (exported.ok) {
+        expect(exported.value).toMatchObject(value);
+      }
+    }
+  });
+
+  it.each([
+    { mode: "progres" },
+    { mode: "block" },
+    { progress: { comentary: true } },
+    { progress: { commentary: "true" } },
+    { progress: { maxLines: 0 } },
+    { progress: { maxLineChars: 1.5 } },
+    { progress: { label: true } },
+    { progress: { toolProgress: true } },
+    { progress: { narration: true } },
+  ])("rejects invalid or unsupported root and account streaming config %j", (streaming) => {
+    for (const value of [{ streaming }, { accounts: { work: { streaming } } }]) {
+      expect(FeishuConfigSchema.safeParse(value).success).toBe(false);
+      expect(
+        validateJsonSchemaValue({
+          schema: FeishuChannelConfigSchema.schema,
+          cacheKey: "feishu-commentary-progress-test",
+          value,
+          applyDefaults: true,
+        }).ok,
+      ).toBe(false);
+    }
+  });
+
+  it("does not enable commentary or override account inheritance through defaults", () => {
+    const result = FeishuConfigSchema.parse({
+      streaming: { mode: "progress", progress: {} },
+      accounts: { work: {} },
+    });
+    expect(FeishuConfigSchema.parse({}).streaming).toBeUndefined();
+    expect(result.streaming?.progress?.commentary).toBeUndefined();
+    expect(result.accounts?.work?.streaming).toBeUndefined();
+  });
+
+  it("inherits root streaming config unless an account replaces the streaming object", () => {
+    const feishu = FeishuConfigSchema.parse({
+      streaming: { mode: "progress", progress: { commentary: true, maxLines: 4 } },
+      accounts: {
+        inherited: {},
+        quiet: { streaming: { mode: "off" } },
+        "no-commentary": { streaming: { mode: "progress", progress: { commentary: false } } },
+      },
+    });
+    const cfg = { channels: { feishu } };
+    expect(resolveFeishuAccount({ cfg, accountId: "inherited" }).config.streaming).toEqual(
+      feishu.streaming,
+    );
+    expect(resolveFeishuAccount({ cfg, accountId: "quiet" }).config.streaming).toEqual({
+      mode: "off",
+    });
+    expect(resolveFeishuAccount({ cfg, accountId: "no-commentary" }).config.streaming).toEqual({
+      mode: "progress",
+      progress: { commentary: false },
+    });
   });
 });
 

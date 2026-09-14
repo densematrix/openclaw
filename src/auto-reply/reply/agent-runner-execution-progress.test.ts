@@ -58,6 +58,107 @@ async function executeTestTurn(
 }
 
 describe("executeAgentTurn: lifecycle progress", () => {
+  it.each([false, true])(
+    "delivers only completed native commentary with durable opt-in=%s",
+    async (commentaryPayloadsEnabled) => {
+      const { createBlockReplyDeliveryHandler } =
+        await vi.importActual<typeof import("./reply-delivery.js")>("./reply-delivery.js");
+      state.createBlockReplyDeliveryHandlerMock.mockImplementationOnce(
+        createBlockReplyDeliveryHandler,
+      );
+      const onBlockReply = vi.fn(async () => {});
+      const onItemEvent = vi.fn();
+      const pendingToolTasks = new Set<Promise<void>>();
+      state.runEmbeddedAgentMock.mockImplementationOnce(async (params: EmbeddedAgentParams) => {
+        for (const phase of ["update", "update", "end", "end"]) {
+          await params.onAgentEvent?.({
+            stream: "item",
+            data: {
+              kind: "preamble",
+              itemId: "commentary-1",
+              phase,
+              progressText: "<think>private</think>Checking the workspace.",
+            },
+          });
+          expect(onBlockReply).toHaveBeenCalledTimes(
+            commentaryPayloadsEnabled && phase === "end" ? 1 : 0,
+          );
+        }
+        // A distinct completed item may legitimately repeat the same paragraph.
+        await params.onAgentEvent?.({
+          stream: "item",
+          data: {
+            kind: "preamble",
+            itemId: "commentary-2",
+            phase: "end",
+            progressText: "Checking the workspace.",
+          },
+        });
+        return { payloads: [{ text: "Final answer." }], meta: {} };
+      });
+
+      const result = await executeTestTurn(
+        { opts: { onBlockReply, onItemEvent, commentaryPayloadsEnabled } },
+        { resolvedVerboseLevel: "off", blockStreamingEnabled: false, pendingToolTasks },
+      );
+      await Promise.all(pendingToolTasks);
+      expect(result.kind).toBe("success");
+      expect(onBlockReply).toHaveBeenCalledTimes(commentaryPayloadsEnabled ? 2 : 0);
+      if (commentaryPayloadsEnabled) {
+        expect(onBlockReply).toHaveBeenCalledWith(
+          expect.objectContaining({ text: "Checking the workspace.", isCommentary: true }),
+        );
+      }
+      expect(onItemEvent).toHaveBeenCalledTimes(5);
+      expect(onItemEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "preamble",
+          phase: "update",
+          ...(commentaryPayloadsEnabled ? { suppressDurableProgress: true } : {}),
+        }),
+      );
+    },
+  );
+
+  it("tracks detached native commentary without requiring an item-preview callback", async () => {
+    let releaseDelivery: (() => void) | undefined;
+    const deliveryPending = new Promise<void>((resolve) => {
+      releaseDelivery = resolve;
+    });
+    const onBlockReply = vi.fn(() => deliveryPending);
+    state.createBlockReplyDeliveryHandlerMock.mockReturnValueOnce(onBlockReply);
+    const pendingToolTasks = new Set<Promise<void>>();
+    state.runEmbeddedAgentMock.mockImplementationOnce(async (params: EmbeddedAgentParams) => {
+      void params.onAgentEvent?.({
+        stream: "item",
+        data: {
+          kind: "preamble",
+          itemId: "detached-commentary",
+          phase: "end",
+          progressText: "Checking the workspace.",
+        },
+      });
+      expect(pendingToolTasks.size).toBe(1);
+      return { payloads: [{ text: "Final answer." }], meta: {} };
+    });
+    try {
+      const result = await executeTestTurn(
+        { opts: { onBlockReply, commentaryPayloadsEnabled: true } },
+        { pendingToolTasks, blockStreamingEnabled: false, resolvedVerboseLevel: "off" },
+      );
+      expect(result.kind).toBe("success");
+      expect(pendingToolTasks.size).toBe(1);
+      expect(onBlockReply).toHaveBeenCalledExactlyOnceWith({
+        text: "Checking the workspace.",
+        isCommentary: true,
+      });
+    } finally {
+      releaseDelivery?.();
+      await Promise.all(pendingToolTasks);
+    }
+    expect(pendingToolTasks.size).toBe(0);
+  });
+
   it("keeps operational agent events from resetting repeated request evidence", async () => {
     state.runEmbeddedAgentMock.mockImplementationOnce(async (params: EmbeddedAgentParams) => {
       const sessionId = params.sessionId ?? "session";

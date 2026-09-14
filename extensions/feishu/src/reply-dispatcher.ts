@@ -7,6 +7,7 @@ import {
 } from "openclaw/plugin-sdk/channel-inbound";
 import {
   createChannelMessageReplyPipeline,
+  createChannelProgressDraftCompositor,
   formatChannelProgressDraftLineForEntry,
   isChannelProgressDraftWorkToolName,
   resolveChannelPreviewStreamMode,
@@ -283,10 +284,14 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   const renderMode = account.config?.renderMode ?? "auto";
   // Streaming cards cannot attach native mention recipients. Bot-authored ingress
   // therefore uses normal cards/posts so every emitted unit reaches the peer bot.
+  const streamingMode = resolveChannelPreviewStreamMode(account.config, "partial");
+  const progressMode = streamingMode === "progress";
+  // Raw replies use core's completed commentary payloads, not CardKit previews.
+  // Core owns ordering, hooks, and deduplication for these ordinary messages.
+  const plainCommentaryEnabled =
+    renderMode === "raw" && progressMode && account.config.streaming?.progress?.commentary === true;
   const streamingEnabled =
-    !requiredMentionTargets?.length &&
-    resolveChannelPreviewStreamMode(account.config, "partial") !== "off" &&
-    renderMode !== "raw";
+    !requiredMentionTargets?.length && streamingMode !== "off" && renderMode !== "raw";
   const hookRunner = getGlobalHookRunner();
   const modifyingHooksRegistered =
     (hookRunner?.hasHooks("reply_payload_sending") ?? false) ||
@@ -303,6 +308,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   let lastPartial = "";
   let reasoningText = "";
   let statusLine = "";
+  let commentaryText = "";
   let snapshotBaseText = "";
   let lastSnapshotTextLength = 0;
   // Partial previews are replaceable; only committed final text may precede an error notice.
@@ -385,6 +391,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     return parts.join("");
   };
 
+  const buildPreviewStreamText = () =>
+    [commentaryText, buildCombinedStreamText(reasoningText, streamText)]
+      .filter(Boolean)
+      .join("\n\n");
+
   const flushStreamingCardUpdate = (combined: string) => {
     const session = streaming;
     const generation = activeStreamingGeneration;
@@ -399,6 +410,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         await session.update(combined);
       }
     });
+    return partialUpdateQueue;
   };
 
   const queueStreamingUpdate = (
@@ -436,7 +448,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       }
       lastSnapshotTextLength = nextText.length;
     }
-    flushStreamingCardUpdate(buildCombinedStreamText(reasoningText, streamText));
+    void flushStreamingCardUpdate(buildPreviewStreamText());
   };
 
   const queueReasoningUpdate = (nextThinking: string) => {
@@ -444,7 +456,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       return;
     }
     reasoningText = nextThinking;
-    flushStreamingCardUpdate(buildCombinedStreamText(reasoningText, streamText));
+    void flushStreamingCardUpdate(buildPreviewStreamText());
   };
 
   const startStreaming = () => {
@@ -516,6 +528,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     lastPartial = "";
     reasoningText = "";
     statusLine = "";
+    commentaryText = "";
     snapshotBaseText = "";
     lastSnapshotTextLength = 0;
     hasStreamingFinalText = false;
@@ -725,6 +738,47 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     }
   };
 
+  const commentaryProgress = createChannelProgressDraftCompositor({
+    entry: account.config,
+    mode: streamingMode,
+    active: previewStreamingEnabled,
+    seed: params.sessionKey ?? chatId,
+    commentaryLinePrefix: "💬 ",
+    commentaryItalics: false,
+    update: async (text) => {
+      commentaryText = text;
+      startStreaming();
+      const session = streaming;
+      const update = flushStreamingCardUpdate(buildPreviewStreamText());
+      // Commentary is best-effort; a failed preview must not poison final delivery.
+      partialUpdateQueue = update.catch((error: unknown) => {
+        params.runtime.error?.(
+          `feishu[${account.accountId}] commentary update failed: ${String(error)}`,
+        );
+      });
+      try {
+        await update;
+        return session?.isActive() === true;
+      } catch {
+        return false;
+      }
+    },
+    deleteCurrent: async () => {
+      commentaryText = "";
+      const remainingText = buildPreviewStreamText();
+      if (remainingText) {
+        await flushStreamingCardUpdate(remainingText);
+      } else {
+        await discardStreamingPreview();
+      }
+    },
+  });
+
+  const finishCommentaryProgress = () => {
+    commentaryProgress.markFinalReplyStarted();
+    commentaryText = "";
+  };
+
   const updateStreamingStatusLine = (
     nextStatusLine: string,
     options?: { startIfNeeded?: boolean },
@@ -735,7 +789,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       return false;
     }
     startStreaming();
-    flushStreamingCardUpdate(buildCombinedStreamText(reasoningText, streamText));
+    void flushStreamingCardUpdate(buildPreviewStreamText());
     return false;
   };
 
@@ -1036,6 +1090,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   };
 
   function queueIdleSideEffects(): Promise<void> {
+    finishCommentaryProgress();
     idleRequestedForReply = true;
     if (activeIdleSideEffectsPromise) {
       return activeIdleSideEffectsPromise;
@@ -1046,7 +1101,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           // Include deliveries appended while CardKit close is in flight; every returned
           // finalization promise must be owned by this idle pass or a later loop iteration.
           const completions = pendingStreamingDeliveries.splice(0);
-          const closeOutcome = await closeStreaming();
+          const closeOutcome = await closeStreaming(
+            progressMode && !streamText.trim() ? "discarded" : "closed",
+          );
           const finalized = closeOutcome.result;
           const ownsCurrentClose = (completion: PendingStreamingDelivery) =>
             closeOutcome.generation !== undefined &&
@@ -1265,6 +1322,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       conversationType: chatId.startsWith("oc_") ? "group" : "direct",
     },
     onSkip: (_payload, info) => {
+      if (info.kind === "final") {
+        finishCommentaryProgress();
+      }
       if (
         replyOutcome?.kind !== "failed" &&
         (info.kind === "final" || (info.kind === "block" && info.reason === "silent"))
@@ -1277,6 +1337,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       }
     },
     beforeDeliver: (payload, info) => {
+      if (info.kind === "final") {
+        finishCommentaryProgress();
+      }
       // Enqueue-time silence may be newer than this queued block. Reset before either
       // modifying hook, since cancellation skips native delivery entirely.
       const preservesNewerSilence =
@@ -1301,13 +1364,15 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         visibleReplySent = false;
         replyOutcome = undefined;
       }
-      if (previewStreamingEnabled && renderMode === "card") {
+      if (previewStreamingEnabled && !progressMode && renderMode === "card") {
         startStreaming();
       }
       await Promise.resolve(typingCallbacks?.onReplyStart?.());
     },
     onIdle: () => queueIdleSideEffects(),
     onCleanup: () => {
+      finishCommentaryProgress();
+      commentaryProgress.cancel();
       typingCallbacks?.onCleanup?.();
     },
   };
@@ -1355,6 +1420,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       }
     },
     deliver: async (inputPayload: ReplyPayload, info) => {
+      if (info.kind === "final") {
+        finishCommentaryProgress();
+      }
       // Delivery runs after modifying hooks. Render here so native cards carry the
       // accepted prose, and a canceled payload never creates a card.
       const prepared = await renderFeishuReplyPayload(inputPayload, {
@@ -1496,7 +1564,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         // Later finals replace stream text. Each presentation fallback owns a
         // separate message; ordinary blocks retain their streaming policy.
         if (hasPresentationFallback || (info?.kind === "block" && !useStreamingCard)) {
-          if (hasPresentationFallback || coreBlockStreamingEnabled) {
+          if (
+            hasPresentationFallback ||
+            coreBlockStreamingEnabled ||
+            (plainCommentaryEnabled && payload.isCommentary === true)
+          ) {
             const firstChunkMentions =
               info?.kind === "final" || (info?.kind === "block" && !sentIndependentBlockText)
                 ? mentionTargets
@@ -1551,7 +1623,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
               hasStreamingFinalText = true;
               snapshotBaseText = "";
               lastSnapshotTextLength = text.length;
-              flushStreamingCardUpdate(buildCombinedStreamText(reasoningText, streamText));
+              void flushStreamingCardUpdate(buildPreviewStreamText());
             }
           }
           // Send media even when streaming handled the text
@@ -1646,28 +1718,71 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     delivery,
     replyOptions: {
       onModelSelected,
+      // Register one commentary owner with core: completed payloads for raw
+      // messages, or a progress draft for cards, including quiet turns.
+      ...(plainCommentaryEnabled || commentaryProgress.commentaryProgressEnabled
+        ? {
+            suppressDefaultToolProgressMessages: true,
+            commentaryProgressEnabled: true,
+            commentaryPayloadsEnabled: true,
+            shouldDeliverCommentaryPayloads: () => plainCommentaryEnabled,
+            onQueuedFollowupAdmitted: async () => {
+              // Queue drains reuse these callbacks after the original dispatch
+              // has gone idle. Reset delivery state for either presentation.
+              await queueIdleSideEffects();
+              commentaryProgress.beginNewTurn({ force: true });
+              deliveredFinalTexts.clear();
+              closedStreamingSettlements.clear();
+              sentIndependentBlockText = false;
+              idleRequestedForReply = false;
+              visibleReplySent = false;
+              replyOutcome = undefined;
+            },
+            onQueuedFollowupSettled: () => queueIdleSideEffects(),
+          }
+        : {}),
       disableBlockStreaming:
         typeof blockStreamingEnabled === "boolean" ? !blockStreamingEnabled : true,
-      onPartialReply: previewStreamingEnabled
-        ? (payload: ReplyPayload) => {
-            if (!payload.text) {
+      onItemEvent:
+        previewStreamingEnabled && progressMode
+          ? async (
+              payload: Parameters<
+                NonNullable<NonNullable<ChannelInboundTurnPlan["replyOptions"]>["onItemEvent"]>
+              >[0],
+            ) => {
+              if (payload.kind !== "preamble") {
+                return false;
+              }
+              return await commentaryProgress.pushCommentaryProgress(
+                stripReasoningTagsFromText(payload.progressText ?? "", {
+                  mode: "strict",
+                  trim: "both",
+                }),
+                { itemId: payload.itemId },
+              );
+            }
+          : undefined,
+      onPartialReply:
+        previewStreamingEnabled && !progressMode
+          ? (payload: ReplyPayload) => {
+              if (!payload.text) {
+                return false;
+              }
+              const cleaned = stripReasoningTagsFromText(payload.text, {
+                mode: "strict",
+                trim: "both",
+              });
+              if (!cleaned) {
+                return false;
+              }
+              startStreaming();
+              queueStreamingUpdate(cleaned, {
+                dedupeWithLastPartial: true,
+                mode: "snapshot",
+              });
               return false;
             }
-            const cleaned = stripReasoningTagsFromText(payload.text, {
-              mode: "strict",
-              trim: "both",
-            });
-            if (!cleaned) {
-              return false;
-            }
-            startStreaming();
-            queueStreamingUpdate(cleaned, {
-              dedupeWithLastPartial: true,
-              mode: "snapshot",
-            });
-            return false;
-          }
-        : undefined,
+          : undefined,
       onReasoningStream: reasoningPreviewEnabled
         ? (payload: ReplyPayload) => {
             if (!payload.text) {

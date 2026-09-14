@@ -4,6 +4,7 @@ import type { RunEmbeddedAgentParams } from "../../agents/embedded-agent-runner/
 import { normalizeAgentPlanSteps } from "../../channels/streaming.js";
 import { logVerbose } from "../../globals.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { stripReasoningTagsFromText } from "../../shared/text/reasoning-tags.js";
 import type { ReplyPayload } from "../types.js";
 import type { AgentLifecycleTerminalBackstop } from "./agent-lifecycle-terminal.js";
 import { buildCommandOutputFromToolResultEvent } from "./agent-runner-command-output.js";
@@ -40,7 +41,10 @@ export function createAgentRunEventHandler(params: {
   notifyUserAboutCompaction: boolean;
   onCompactionCompleted: () => number;
   messageToolDeliveryState: MessageToolDeliveryState;
+  blockReplyHandler?: (payload: ReplyPayload) => Promise<void>;
 }): NonNullable<RunEmbeddedAgentParams["onAgentEvent"]> {
+  const deliveredCommentaryItems = new Set<string>();
+  let commentaryDeliveryChain = Promise.resolve();
   const shouldSuppressProgressAfterMessageToolDelivery = () =>
     params.sourceRepliesAreToolOnly &&
     params.messageToolDeliveryState.completed &&
@@ -162,7 +166,36 @@ export function createAgentRunEventHandler(params: {
         typeof evt.data.commandBearing === "boolean" ? evt.data.commandBearing : undefined;
       const itemApprovalId = readStringValue(evt.data.approvalId);
       const itemApprovalSlug = readStringValue(evt.data.approvalSlug);
-      await params.turn.opts?.onItemEvent?.({
+      const itemId = readStringValue(evt.data.itemId);
+      const durableCommentary =
+        evt.data.kind === "preamble" &&
+        params.turn.opts?.commentaryPayloadsEnabled === true &&
+        params.blockReplyHandler !== undefined;
+      let commentaryDelivery: Promise<void> | undefined;
+      if (durableCommentary && itemPhase === "end") {
+        const text = stripReasoningTagsFromText(itemProgressText ?? "", {
+          mode: "strict",
+          trim: "both",
+        });
+        if (text && (!itemId || !deliveredCommentaryItems.has(itemId))) {
+          if (itemId) {
+            deliveredCommentaryItems.add(itemId);
+          }
+          commentaryDelivery = commentaryDeliveryChain.then(() =>
+            params.blockReplyHandler?.({ text, isCommentary: true }),
+          );
+          // Native harness events are detached; final accounting must drain the
+          // completed paragraphs without depending on the preview callback lane.
+          commentaryDeliveryChain = commentaryDelivery.catch((error: unknown) => {
+            logVerbose(`commentary delivery failed (non-fatal): ${String(error)}`);
+          });
+          const task = commentaryDeliveryChain.finally(() => {
+            params.turn.pendingToolTasks.delete(task);
+          });
+          params.turn.pendingToolTasks.add(task);
+        }
+      }
+      const itemProgress = params.turn.opts?.onItemEvent?.({
         itemId: readStringValue(evt.data.itemId),
         kind: readStringValue(evt.data.kind),
         title: readStringValue(evt.data.title),
@@ -176,7 +209,9 @@ export function createAgentRunEventHandler(params: {
         ...(itemCommandBearing !== undefined ? { commandBearing: itemCommandBearing } : {}),
         ...(itemApprovalId !== undefined ? { approvalId: itemApprovalId } : {}),
         ...(itemApprovalSlug !== undefined ? { approvalSlug: itemApprovalSlug } : {}),
+        ...(durableCommentary ? { suppressDurableProgress: true } : {}),
       });
+      await Promise.all([itemProgress, commentaryDelivery]);
     }
     if (evt.stream === "plan" && !shouldSuppressProgressAfterMessageToolDelivery()) {
       await params.turn.opts?.onPlanUpdate?.({
