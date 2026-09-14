@@ -48,4 +48,4 @@ TaskFlow records persist in SQLite. Controllers must reload the latest record an
 
 Plugin authors use `api.runtime.tasks.managedFlows`; `flows` and `runs` provide owner-scoped lookups. `runTask` links an **already launched, authoritative** ACP/subagent execution with matching owner and canonical run/session IDs; it never launches one. Do not invent IDs, timestamps or backing records. See the [plugin launch/link contract](https://docs.openclaw.ai/plugins/sdk-runtime) and [Task Flow](https://docs.openclaw.ai/automation/taskflow).
 
-For inbox routing and real-adapter requirements, read `skills/taskflow-inbox-triage/SKILL.md`. For tool setup, see [Lobster](https://docs.openclaw.ai/tools/lobster).
+For inbox routing and real-adapter requirements, read [inbox routing](references/inbox-routing.md). For tool setup, see [Lobster](https://docs.openclaw.ai/tools/lobster).
